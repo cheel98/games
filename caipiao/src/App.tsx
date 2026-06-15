@@ -1,615 +1,777 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { loadOrCreateAppState, saveAppState, type PersistedAppState } from './lotteryDb';
+import {
+  createInitialState,
+  getPlay,
+  getZoneValues,
+  lotteryGames,
+  lotteryIds,
+  normalizeTicketBetCount,
+} from './lotteryRules';
+import type {
+  LotteryGame,
+  LotteryId,
+  LotteryState,
+  LotteryTicket,
+  NumberStyle,
+  PrizeLine,
+  WinningNumber,
+} from './lotteryTypes';
 
-// ── 类型 ──────────────────────────────────────────────
-interface Ticket {
-  reds: number[];
-  blue: number;
+function formatNumber(value: number): string {
+  return value.toLocaleString('zh-CN');
 }
 
-interface CompoundTicket {
-  reds: number[];
-  blues: number[];
+function formatBall(value: number): string {
+  return String(value).padStart(2, '0');
 }
 
-interface TicketRecord {
-  attempt: number;
-  ticket: Ticket;
-}
-
-type Speed = 'slow' | 'medium' | 'fast' | 'ultra';
-
-// ── 常量 ──────────────────────────────────────────────
-const RED_MAX = 33;
-const RED_COUNT = 6;
-const BLUE_MAX = 16;
-const PRICE_PER_BET = 2;
-const HISTORY_LIMIT = 30;
-const TOTAL_COMBINATIONS = 17_721_088; // C(33,6) * 16
-
-const SPEED_CONFIG: Record<Speed, { label: string; desc: string }> = {
-  slow:   { label: '慢速', desc: '每次1注，看清每一注' },
-  medium: { label: '中速', desc: '~50万次/秒' },
-  fast:   { label: '快速', desc: '~200万次/秒' },
-  ultra:  { label: '极速', desc: '全速冲刺' },
-};
-
-const SPEED_BUDGET: Record<Speed, number> = {
-  slow: 0,
-  medium: 30,
-  fast: 60,
-  ultra: 120,
-};
-
-const SPEED_DELAY: Record<Speed, number> = {
-  slow: 250,
-  medium: 0,
-  fast: 0,
-  ultra: 0,
-};
-
-// ── 工具函数 ──────────────────────────────────────────
-function sampleUnique(max: number, count: number): number[] {
-  const pool = Array.from({ length: max }, (_, i) => i + 1);
-  for (let i = 0; i < count; i++) {
-    const j = i + Math.floor(Math.random() * (max - i));
-    [pool[i], pool[j]] = [pool[j], pool[i]];
-  }
-  return pool.slice(0, count).sort((a, b) => a - b);
-}
-
-function generateTicket(): Ticket {
-  const reds = sampleUnique(RED_MAX, RED_COUNT);
-  const blue = Math.floor(Math.random() * BLUE_MAX) + 1;
-  return { reds, blue };
-}
-
-function recordTicketNumbers(ticket: Ticket, reds: Set<number>, blues: Set<number>): void {
-  ticket.reds.forEach((red) => reds.add(red));
-  blues.add(ticket.blue);
-}
-
-function createCompoundSnapshot(reds: Set<number>, blues: Set<number>): CompoundTicket {
-  return {
-    reds: Array.from(reds).sort((a, b) => a - b),
-    blues: Array.from(blues).sort((a, b) => a - b),
-  };
-}
-
-function ticketCoveredBySelection(ticket: Ticket, reds: Set<number>, blues: Set<number>): boolean {
-  return blues.has(ticket.blue) && ticket.reds.every((red) => reds.has(red));
-}
-
-function combination(n: number, k: number): number {
-  if (n < k) return 0;
-  let result = 1;
-  for (let i = 1; i <= k; i++) {
-    result = (result * (n - k + i)) / i;
-  }
-  return result;
-}
-
-function calculateBetCount(redCount: number, blueCount: number): number {
-  return combination(redCount, RED_COUNT) * blueCount;
-}
-
-function formatNum(n: number): string {
-  return n.toLocaleString('zh-CN');
-}
-
-function formatElapsed(ms: number): string {
-  if (ms < 1000) return `${ms}ms`;
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}秒`;
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  if (m < 60) return `${m}分${sec}秒`;
-  const h = Math.floor(m / 60);
-  return `${h}时${m % 60}分${sec}秒`;
-}
-
-// ── 球组件 ────────────────────────────────────────────
 function Ball({
-  number,
-  type,
+  value,
+  style,
   selected,
-  onClick,
+  matched,
   disabled,
-  size = 'md',
+  onClick,
 }: {
-  number: number;
-  type: 'red' | 'blue';
+  value: number;
+  style: NumberStyle;
   selected?: boolean;
-  onClick?: () => void;
+  matched?: boolean;
   disabled?: boolean;
-  size?: 'sm' | 'md' | 'lg';
+  onClick?: () => void;
 }) {
   return (
     <button
-      className={`ball ball-${type} ball-${size}${selected ? ' selected' : ''}${disabled ? ' disabled' : ''}`}
-      onClick={onClick}
+      className={`ball ball-${style}${selected ? ' selected' : ''}${matched ? ' matched' : ''}`}
       disabled={disabled}
+      onClick={onClick}
       type="button"
     >
-      {String(number).padStart(2, '0')}
+      {style === 'dice' ? value : formatBall(value)}
     </button>
   );
 }
 
-// ── 主应用 ────────────────────────────────────────────
+function getWinningStyles(game: LotteryGame, winningNumber: WinningNumber): NumberStyle[][] {
+  if (game.id === 'ssq' || game.id === 'dlt') return [['red'], ['blue']];
+  if (game.id === 'qlc') {
+    return [winningNumber.numbers[0].map((_, index) => index === 7 ? 'blue' : 'red')];
+  }
+  if (game.id === 'k3') return [['dice']];
+  return [['gold']];
+}
+
+function NumberDisplay({
+  groups,
+  styles,
+  matchedGroups,
+}: {
+  groups: number[][];
+  styles: NumberStyle[][];
+  matchedGroups?: number[][];
+}) {
+  return (
+    <div className="number-display">
+      {groups.map((numbers, groupIndex) => (
+        <div className="number-group" key={`group-${groupIndex}`}>
+          {numbers.map((number, numberIndex) => (
+            <Ball
+              key={`${groupIndex}-${numberIndex}-${number}`}
+              value={number}
+              style={styles[groupIndex]?.[numberIndex] ?? styles[groupIndex]?.[0] ?? 'gold'}
+              matched={matchedGroups?.[groupIndex]?.includes(number)}
+              disabled
+            />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function createTicketStyles(game: LotteryGame, ticket: LotteryTicket): NumberStyle[][] {
+  const play = getPlay(game, ticket.playType);
+  return ticket.selections.map((_, index) => [play.zones[index]?.style ?? 'gold']);
+}
+
+function getTicketMatchedGroups(
+  game: LotteryGame,
+  ticket: LotteryTicket,
+  winningNumber: WinningNumber,
+): number[][] {
+  if (game.id === 'fc3d' || game.id === 'pl3' || game.id === 'pl5') {
+    return winningNumber.numbers[0].map((number) => [number]);
+  }
+  if (game.id !== 'k3') return winningNumber.numbers;
+
+  const dice = winningNumber.numbers[0];
+  const counts = new Map<number, number>();
+  dice.forEach((number) => counts.set(number, (counts.get(number) ?? 0) + 1));
+  const pair = [...counts.entries()].find(([, count]) => count === 2)?.[0];
+  const single = [...counts.entries()].find(([, count]) => count === 1)?.[0];
+  if (ticket.playType === 'sum') return [[dice.reduce((total, number) => total + number, 0)]];
+  if (ticket.playType === 'double-single') return [[pair ?? 0], [single ?? 0]];
+  if (ticket.playType === 'triple-single') return [[counts.size === 1 ? dice[0] : 0]];
+  if (ticket.playType === 'double-all') return [[pair ?? 0]];
+  return [[...counts.keys()]];
+}
+
+function ticketResult(game: LotteryGame, ticket: LotteryTicket, winningNumber: WinningNumber) {
+  const lines = game.analyzeTicket(ticket, winningNumber);
+  return {
+    count: lines.reduce((total, line) => total + line.count, 0),
+    amount: lines.reduce((total, line) => total + line.amount, 0),
+    labels: lines.filter((line) => line.count > 0).map((line) => line.label),
+  };
+}
+
+function totalPrize(lines: PrizeLine[]): number {
+  return lines.reduce((total, line) => total + line.amount, 0);
+}
+
+interface RuleDotGroup {
+  style: NumberStyle;
+  total: number;
+  bright: number;
+}
+
+type RulePattern = RuleDotGroup[];
+
+function zonePattern(
+  style: NumberStyle,
+  total: number,
+  bright: number,
+): RuleDotGroup {
+  return { style, total, bright };
+}
+
+function getPrizeRulePatterns(game: LotteryGame, line: PrizeLine): RulePattern[] {
+  if (game.id === 'ssq') {
+    const matches: Record<string, Array<[number, number]>> = {
+      '1': [[6, 1]],
+      '2': [[6, 0]],
+      '3': [[5, 1]],
+      '4': [[5, 0], [4, 1]],
+      '5': [[4, 0], [3, 1]],
+      '6': [[2, 1], [1, 1], [0, 1]],
+    };
+    return (matches[line.key] ?? []).map(([red, blue]) => [
+      zonePattern('red', 6, red),
+      zonePattern('blue', 1, blue),
+    ]);
+  }
+
+  if (game.id === 'dlt') {
+    const matches: Record<string, Array<[number, number]>> = {
+      '1': [[5, 2]],
+      '2': [[5, 1]],
+      '3': [[5, 0]],
+      '4': [[4, 2]],
+      '5': [[4, 1]],
+      '6': [[3, 2]],
+      '7': [[4, 0]],
+      '8': [[3, 1], [2, 2]],
+      '9': [[3, 0], [2, 1], [1, 2], [0, 2]],
+    };
+    return (matches[line.key] ?? []).map(([front, back]) => [
+      zonePattern('red', 5, front),
+      zonePattern('blue', 2, back),
+    ]);
+  }
+
+  if (game.id === 'qlc') {
+    const matches: Record<string, [number, number, number]> = {
+      '1': [7, 0, 0],
+      '2': [6, 1, 0],
+      '3': [6, 0, 1],
+      '4': [5, 1, 1],
+      '5': [5, 0, 2],
+      '6': [4, 1, 2],
+      '7': [4, 0, 3],
+    };
+    const [basic, special, missed] = matches[line.key] ?? [0, 0, 7];
+    return [[
+      zonePattern('red', basic, basic),
+      zonePattern('blue', special, special),
+      zonePattern('red', missed, 0),
+    ]];
+  }
+
+  if (game.id === 'pl5') return [[zonePattern('gold', 5, 5)]];
+  if (game.id === 'fc3d' || game.id === 'pl3') {
+    if (line.key === 'group3') {
+      return [[zonePattern('gold', 2, 2), zonePattern('gold', 1, 0)]];
+    }
+    return [[zonePattern('gold', 3, 3)]];
+  }
+
+  const k3Patterns: Record<string, RulePattern> = {
+    sum: [zonePattern('dice', 3, 3)],
+    'triple-single': [zonePattern('dice', 3, 3)],
+    'triple-all': [zonePattern('dice', 3, 3)],
+    'double-single': [zonePattern('dice', 2, 2), zonePattern('dice', 1, 1)],
+    'double-all': [zonePattern('dice', 2, 2), zonePattern('dice', 1, 0)],
+    'triple-different': [zonePattern('green', 3, 3)],
+    'straight-all': [zonePattern('green', 3, 3)],
+    'double-different': [zonePattern('blue', 2, 2), zonePattern('dice', 1, 0)],
+  };
+  return [k3Patterns[line.key] ?? []];
+}
+
+function PrizeRuleDots({ game, line }: { game: LotteryGame; line: PrizeLine }) {
+  const patterns = getPrizeRulePatterns(game, line);
+  return (
+    <span className="prize-rule-dots" aria-label={line.rule} title={line.rule}>
+      {patterns.map((pattern, patternIndex) => (
+        <span className="rule-pattern" key={`pattern-${patternIndex}`}>
+          {patternIndex > 0 && <span className="rule-or">或</span>}
+          {pattern.map((group, groupIndex) => (
+            <span className="rule-dot-group" key={`${group.style}-${groupIndex}`}>
+              {Array.from({ length: group.total }, (_, dotIndex) => (
+                <span
+                  className={`rule-dot rule-dot-${group.style}${dotIndex < group.bright ? ' bright' : ''}`}
+                  key={dotIndex}
+                />
+              ))}
+            </span>
+          ))}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function TicketBetEditor({
+  baseBetCount,
+  betCount,
+  disabled,
+  onCommit,
+}: {
+  baseBetCount: number;
+  betCount: number;
+  disabled: boolean;
+  onCommit: (betCount: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(betCount));
+
+  const commit = () => {
+    const normalized = normalizeTicketBetCount(baseBetCount, Number(draft));
+    setDraft(String(normalized));
+    if (normalized !== betCount) onCommit(normalized);
+  };
+
+  return (
+    <label className="ticket-bet-editor">
+      <span>注数</span>
+      <input
+        aria-label={`修改注数，每份包含${baseBetCount}注`}
+        disabled={disabled}
+        inputMode="numeric"
+        min={baseBetCount}
+        onBlur={commit}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') event.currentTarget.blur();
+        }}
+        step={baseBetCount}
+        title={baseBetCount > 1 ? `必须为 ${baseBetCount} 的整数倍` : '请输入正整数'}
+        type="number"
+        value={draft}
+      />
+    </label>
+  );
+}
+
 export default function App() {
-  // 选号状态
-  const [selectedReds, setSelectedReds] = useState<Set<number>>(new Set());
-  const [selectedBlues, setSelectedBlues] = useState<Set<number>>(new Set());
-
-  // 模拟状态
-  const [isRunning, setIsRunning] = useState(false);
-  const [attempts, setAttempts] = useState(0);
-  const [currentTicket, setCurrentTicket] = useState<Ticket | null>(null);
-  const [ticketHistory, setTicketHistory] = useState<TicketRecord[]>([]);
-  const [matched, setMatched] = useState(false);
-  const [matchedTicket, setMatchedTicket] = useState<Ticket | null>(null);
-  const [winningCompound, setWinningCompound] = useState<CompoundTicket | null>(null);
-  const [speed, setSpeed] = useState<Speed>('fast');
-  const [elapsedMs, setElapsedMs] = useState(0);
-  const [tps, setTps] = useState(0);
-
-  // 可变引用
-  const attemptsRef = useRef(0);
-  const runningRef = useRef(false);
-  const timerRef = useRef<number | null>(null);
-  const startRef = useRef(0);
-  const tpsTimeRef = useRef(0);
-  const tpsCountRef = useRef(0);
-  const selectedRedsRef = useRef<Set<number>>(new Set());
-  const selectedBluesRef = useRef<Set<number>>(new Set());
-  const randomRedsRef = useRef<Set<number>>(new Set());
-  const randomBluesRef = useRef<Set<number>>(new Set());
-  const speedRef = useRef<Speed>('fast');
-  const stepRef = useRef<() => void>(() => {});
-
-  // ── 选号 ──
-  const toggleRed = useCallback((n: number) => {
-    if (runningRef.current) return;
-    setSelectedReds((prev) => {
-      const next = new Set(prev);
-      if (next.has(n)) next.delete(n);
-      else next.add(n);
-      return next;
-    });
-  }, []);
-
-  const selectBlue = useCallback((n: number) => {
-    if (runningRef.current) return;
-    setSelectedBlues((prev) => {
-      const next = new Set(prev);
-      if (next.has(n)) next.delete(n);
-      else next.add(n);
-      return next;
-    });
-  }, []);
-
-  const randomize = useCallback(() => {
-    if (runningRef.current) return;
-    const redCount = Math.max(selectedReds.size, RED_COUNT);
-    const blueCount = Math.max(selectedBlues.size, 1);
-    setSelectedReds(new Set(sampleUnique(RED_MAX, redCount)));
-    setSelectedBlues(new Set(sampleUnique(BLUE_MAX, blueCount)));
-  }, [selectedReds.size, selectedBlues.size]);
-
-  const finish = useCallback((ticket: Ticket) => {
-    const elapsed = performance.now() - startRef.current;
-    runningRef.current = false;
-    if (timerRef.current != null) {
-      cancelAnimationFrame(timerRef.current);
-      clearTimeout(timerRef.current);
-    }
-    setAttempts(attemptsRef.current);
-    setElapsedMs(Math.round(elapsed));
-    setTps(0);
-    setMatchedTicket(ticket);
-    setWinningCompound(createCompoundSnapshot(randomRedsRef.current, randomBluesRef.current));
-    setMatched(true);
-    setIsRunning(false);
-    setCurrentTicket(ticket);
-    setTicketHistory((prev) => [
-      { attempt: attemptsRef.current, ticket },
-      ...prev,
-    ].slice(0, HISTORY_LIMIT));
-  }, []);
-
-  // ── 模拟核心 ──
-  const step = useCallback(() => {
-    if (!runningRef.current) return;
-    const spd = speedRef.current;
-    const budget = SPEED_BUDGET[spd];
-    let last: Ticket | null = null;
-
-    if (spd === 'slow') {
-      attemptsRef.current++;
-      last = generateTicket();
-      recordTicketNumbers(last, randomRedsRef.current, randomBluesRef.current);
-      if (ticketCoveredBySelection(last, selectedRedsRef.current, selectedBluesRef.current)) { finish(last); return; }
-    } else {
-      const t0 = performance.now();
-      while (performance.now() - t0 < budget) {
-        attemptsRef.current++;
-        last = generateTicket();
-        recordTicketNumbers(last, randomRedsRef.current, randomBluesRef.current);
-        if (ticketCoveredBySelection(last, selectedRedsRef.current, selectedBluesRef.current)) { finish(last); return; }
-      }
-    }
-
-    // 更新 TPS
-    const now = performance.now();
-    if (now - tpsTimeRef.current > 500) {
-      setTps(Math.round((attemptsRef.current - tpsCountRef.current) / ((now - tpsTimeRef.current) / 1000)));
-      tpsTimeRef.current = now;
-      tpsCountRef.current = attemptsRef.current;
-    }
-
-    setAttempts(attemptsRef.current);
-    setElapsedMs(Math.round(now - startRef.current));
-    setWinningCompound(createCompoundSnapshot(randomRedsRef.current, randomBluesRef.current));
-    if (last) {
-      setCurrentTicket(last);
-      setTicketHistory((prev) => [
-        { attempt: attemptsRef.current, ticket: last },
-        ...prev,
-      ].slice(0, HISTORY_LIMIT));
-    }
-
-    if (spd === 'slow') {
-      timerRef.current = window.setTimeout(() => stepRef.current(), SPEED_DELAY.slow);
-    } else {
-      timerRef.current = requestAnimationFrame(() => stepRef.current());
-    }
-  }, [finish]);
+  const [appState, setAppState] = useState<PersistedAppState | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [storageError, setStorageError] = useState('');
+  const hasLoaded = useRef(false);
+  const saveSequence = useRef(0);
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
-    stepRef.current = step;
-  }, [step]);
-
-  const start = useCallback(() => {
-    if (selectedReds.size < RED_COUNT || selectedBlues.size === 0) return;
-    selectedRedsRef.current = new Set(selectedReds);
-    selectedBluesRef.current = new Set(selectedBlues);
-    randomRedsRef.current = new Set();
-    randomBluesRef.current = new Set();
-    attemptsRef.current = 0;
-    startRef.current = performance.now();
-    tpsTimeRef.current = performance.now();
-    tpsCountRef.current = 0;
-    speedRef.current = speed;
-
-    setAttempts(0);
-    setCurrentTicket(null);
-    setTicketHistory([]);
-    setMatched(false);
-    setMatchedTicket(null);
-    setWinningCompound(null);
-    setElapsedMs(0);
-    setTps(0);
-    setIsRunning(true);
-    runningRef.current = true;
-
-    timerRef.current = requestAnimationFrame(step);
-  }, [selectedReds, selectedBlues, speed, step]);
-
-  const stop = useCallback(() => {
-    runningRef.current = false;
-    if (timerRef.current != null) {
-      cancelAnimationFrame(timerRef.current);
-      clearTimeout(timerRef.current);
-    }
-    setIsRunning(false);
-  }, []);
-
-  const reset = useCallback(() => {
-    stop();
-    setSelectedReds(new Set());
-    setSelectedBlues(new Set());
-    randomRedsRef.current = new Set();
-    randomBluesRef.current = new Set();
-    setAttempts(0);
-    setCurrentTicket(null);
-    setTicketHistory([]);
-    setMatched(false);
-    setMatchedTicket(null);
-    setWinningCompound(null);
-    setElapsedMs(0);
-    setTps(0);
-  }, [stop]);
-
-  const rerun = useCallback(() => {
-    setAttempts(0);
-    setCurrentTicket(null);
-    setTicketHistory([]);
-    setMatched(false);
-    setMatchedTicket(null);
-    setWinningCompound(null);
-    setElapsedMs(0);
-    setTps(0);
-    // 保持选号，重新开始
-    setTimeout(() => {
-      if (selectedReds.size >= RED_COUNT && selectedBlues.size > 0) {
-        selectedRedsRef.current = new Set(selectedReds);
-        selectedBluesRef.current = new Set(selectedBlues);
-        randomRedsRef.current = new Set();
-        randomBluesRef.current = new Set();
-        attemptsRef.current = 0;
-        startRef.current = performance.now();
-        tpsTimeRef.current = performance.now();
-        tpsCountRef.current = 0;
-        speedRef.current = speed;
-        setIsRunning(true);
-        runningRef.current = true;
-        timerRef.current = requestAnimationFrame(step);
-      }
-    }, 50);
-  }, [selectedReds, selectedBlues, speed, step]);
-
-  useEffect(() => {
+    let active = true;
+    loadOrCreateAppState()
+      .then((state) => {
+        if (active) {
+          setAppState(state);
+          hasLoaded.current = true;
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          const fallback = {
+            activeLotteryId: 'ssq' as const,
+            lotteries: Object.fromEntries(
+              lotteryIds.map((id) => [id, createInitialState(lotteryGames[id])]),
+            ) as Record<LotteryId, LotteryState>,
+          };
+          setAppState(fallback);
+          setStorageError(error instanceof Error ? error.message : '本地数据库不可用');
+        }
+      })
+      .finally(() => {
+        if (active) setIsLoading(false);
+      });
     return () => {
-      if (timerRef.current != null) {
-        cancelAnimationFrame(timerRef.current);
-        clearTimeout(timerRef.current);
-      }
+      active = false;
     };
   }, []);
 
-  // ── 派生状态 ──
-  const betCount = calculateBetCount(selectedReds.size, selectedBlues.size);
-  const expectedAttempts = betCount > 0 ? TOTAL_COMBINATIONS / betCount : TOTAL_COMBINATIONS;
-  const canStart = betCount > 0 && !isRunning;
-  const hasSelection = selectedReds.size > 0 || selectedBlues.size > 0;
-  const sortedReds = Array.from(selectedReds).sort((a, b) => a - b);
-  const sortedBlues = Array.from(selectedBlues).sort((a, b) => a - b);
+  useEffect(() => {
+    if (!appState || !hasLoaded.current) return;
+    const currentSequence = ++saveSequence.current;
+    saveQueue.current = saveQueue.current
+      .catch(() => undefined)
+      .then(() => saveAppState(appState))
+      .then(() => {
+        if (currentSequence === saveSequence.current) setStorageError('');
+      })
+      .catch((error: unknown) => {
+        if (currentSequence === saveSequence.current) {
+          setStorageError(error instanceof Error ? error.message : '无法保存本地状态');
+        }
+      });
+  }, [appState]);
+
+  const updateLottery = useCallback((
+    lotteryId: LotteryId,
+    updater: (current: LotteryState) => LotteryState,
+  ) => {
+    setAppState((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        lotteries: {
+          ...current.lotteries,
+          [lotteryId]: updater(current.lotteries[lotteryId]),
+        },
+      };
+    });
+  }, []);
+
+  if (isLoading || !appState) {
+    return <div className="loading-screen">正在恢复各彩种模拟状态...</div>;
+  }
+
+  const activeId = appState.activeLotteryId;
+  const game = lotteryGames[activeId];
+  const state = appState.lotteries[activeId];
+  const play = getPlay(game, state.playType);
+  const totalBetCount = state.tickets.reduce((total, ticket) => total + ticket.betCount, 0);
+  const totalCost = state.tickets.reduce((total, ticket) => total + ticket.cost, 0);
+  const previewBetCount = game.calculateBetCount(state.playType, state.selections);
+  const previewCost = previewBetCount * (game.pricePerBet + (state.appended ? 1 : 0));
+  const prizeSummary = state.isDrawn
+    ? game.summarizePrizes(state.tickets, state.winningNumber)
+    : [];
+  const prizeAmount = totalPrize(prizeSummary);
+  const winningCount = prizeSummary.reduce((total, line) => total + line.count, 0);
+
+  const selectLottery = (lotteryId: LotteryId) => {
+    setAppState((current) => current ? { ...current, activeLotteryId: lotteryId } : current);
+  };
+
+  const changePlay = (playType: string) => {
+    const nextPlay = getPlay(game, playType);
+    updateLottery(activeId, (current) => ({
+      ...current,
+      playType: nextPlay.id,
+      selections: nextPlay.zones.map(() => []),
+      selectedCounts: nextPlay.zones.map((zone) => zone.defaultCount),
+      appended: false,
+    }));
+  };
+
+  const toggleSelection = (zoneIndex: number, value: number) => {
+    if (state.isDrawn) return;
+    updateLottery(activeId, (current) => {
+      const next = current.selections.map((values) => [...values]);
+      const zone = play.zones[zoneIndex];
+      const values = new Set(next[zoneIndex] ?? []);
+      if (values.has(value)) values.delete(value);
+      else if (values.size < zone.pickMax) values.add(value);
+      next[zoneIndex] = Array.from(values).sort((a, b) => a - b);
+      return { ...current, selections: next };
+    });
+  };
+
+  const changeSelectedCount = (zoneIndex: number, count: number) => {
+    updateLottery(activeId, (current) => {
+      const counts = [...current.selectedCounts];
+      counts[zoneIndex] = count;
+      return { ...current, selectedCounts: counts };
+    });
+  };
+
+  const buyTicket = () => {
+    if (state.isDrawn) return;
+    const id = state.tickets.length + 1;
+    const ticket = state.purchaseMode === 'random'
+      ? game.createRandomTicket(state.playType, state.selectedCounts, state.appended, id)
+      : game.createManualTicket(state.playType, state.selections, state.appended, id);
+    if (!ticket) return;
+    updateLottery(activeId, (current) => ({
+      ...current,
+      tickets: [...current.tickets, ticket],
+      selections: state.purchaseMode === 'manual' ? play.zones.map(() => []) : current.selections,
+    }));
+  };
+
+  const setTicketBetCount = (ticketId: number, requestedBetCount: number) => {
+    if (state.isDrawn) return;
+    updateLottery(activeId, (current) => ({
+      ...current,
+      tickets: current.tickets.map((ticket) => {
+        if (ticket.id !== ticketId) return ticket;
+        const baseBetCount = game.calculateBetCount(ticket.playType, ticket.selections);
+        const betCount = normalizeTicketBetCount(baseBetCount, requestedBetCount);
+        const multiplier = betCount / baseBetCount;
+        const unitPrice = game.pricePerBet + (ticket.appended ? 1 : 0);
+        return {
+          ...ticket,
+          multiplier,
+          betCount,
+          cost: betCount * unitPrice,
+        };
+      }),
+    }));
+  };
+
+  const newRound = () => {
+    const next = createInitialState(game);
+    next.playType = state.playType;
+    next.purchaseMode = state.purchaseMode;
+    const activePlay = getPlay(game, next.playType);
+    next.selections = activePlay.zones.map(() => []);
+    next.selectedCounts = activePlay.zones.map((zone) => zone.defaultCount);
+    updateLottery(activeId, () => next);
+  };
+
+  const manualTicket = game.createManualTicket(
+    state.playType,
+    state.selections,
+    state.appended,
+    state.tickets.length + 1,
+  );
+  const canBuy = !state.isDrawn
+    && (state.purchaseMode === 'random' || manualTicket !== null);
 
   return (
     <div className="app">
-      {/* 标题 */}
       <header className="header">
-        <h1 className="title">双色球机选模拟器</h1>
-        <p className="subtitle">
-          设定开奖号码，看机选多少次才能中一等奖
-          <span className="odds">（概率 1/{formatNum(TOTAL_COMBINATIONS)}）</span>
-        </p>
+        <div className="eyebrow">本地娱乐模拟 · 不连接真实购彩平台</div>
+        <h1>{game.name}</h1>
+        <p>{game.subtitle}</p>
       </header>
 
-      <div className="content-layout">
-      <main className="main">
-        {/* ─── 选号区 ─── */}
-        <section className="card">
-          <div className="card-head">
-            <h2>开奖号码</h2>
-            <button className="btn-inline" onClick={randomize} disabled={isRunning} type="button">
-              🎲 随机选号
+      <nav className="lottery-nav" aria-label="彩种切换">
+        {lotteryIds.map((lotteryId) => {
+          const item = lotteryGames[lotteryId];
+          return (
+            <button
+              className={lotteryId === activeId ? 'active' : ''}
+              key={lotteryId}
+              onClick={() => selectLottery(lotteryId)}
+              type="button"
+            >
+              <strong>{item.shortName}</strong>
+              {item.retired && <span>历史玩法</span>}
             </button>
+          );
+        })}
+      </nav>
+
+      {game.retired && (
+        <div className="retired-notice">
+          快3等高频快开游戏已退市，本入口仅用于历史规则演示，不代表当前在售彩票。
+        </div>
+      )}
+      {storageError && <div className="storage-error">{storageError}，当前操作仍保留在页面内存中。</div>}
+
+      <main>
+        <section className="card purchase-card">
+          <div className="card-head">
+            <div>
+              <h2>选择玩法与号码</h2>
+              <span>{state.isDrawn ? '本期已开奖，请开始新一期' : '可连续购买多张票后统一开奖'}</span>
+            </div>
+            <a href={game.sourceUrl} target="_blank" rel="noreferrer">
+              规则：{game.ruleVersion}
+            </a>
           </div>
 
-          <div className="ball-group">
-            <div className="group-label">红球 <span className="dim">（至少选 6 个，1-33）</span></div>
-            <div className="ball-grid red-grid">
-              {Array.from({ length: RED_MAX }, (_, i) => i + 1).map((n) => (
-                <Ball key={n} number={n} type="red" selected={selectedReds.has(n)} onClick={() => toggleRed(n)} disabled={isRunning} />
+          <div className="play-tabs">
+            {game.plays.map((item) => (
+              <button
+                className={item.id === state.playType ? 'active' : ''}
+                disabled={state.isDrawn}
+                key={item.id}
+                onClick={() => changePlay(item.id)}
+                type="button"
+              >
+                {item.name}
+              </button>
+            ))}
+          </div>
+          <p className="play-description">{play.description}</p>
+
+          <div className="mode-row">
+            <div className="mode-tabs">
+              <button
+                className={state.purchaseMode === 'random' ? 'active' : ''}
+                disabled={state.isDrawn}
+                onClick={() => updateLottery(activeId, (current) => ({
+                  ...current,
+                  purchaseMode: 'random',
+                  selections: play.zones.map(() => []),
+                }))}
+                type="button"
+              >
+                随机购买
+              </button>
+              <button
+                className={state.purchaseMode === 'manual' ? 'active' : ''}
+                disabled={state.isDrawn}
+                onClick={() => updateLottery(activeId, (current) => ({
+                  ...current,
+                  purchaseMode: 'manual',
+                }))}
+                type="button"
+              >
+                自选号码
+              </button>
+            </div>
+            {play.appendable && (
+              <label className="append-toggle">
+                <input
+                  checked={state.appended}
+                  disabled={state.isDrawn}
+                  onChange={(event) => updateLottery(activeId, (current) => ({
+                    ...current,
+                    appended: event.target.checked,
+                  }))}
+                  type="checkbox"
+                />
+                追加投注（每注+1元）
+              </label>
+            )}
+          </div>
+
+          {play.zones.length === 0 ? (
+            <div className="no-selection">该玩法无需选择具体号码，直接购买即可。</div>
+          ) : state.purchaseMode === 'random' ? (
+            <div className="count-grid">
+              {play.zones.map((zone, index) => (
+                <label key={zone.id}>
+                  <span>{zone.label}数量</span>
+                  <select
+                    disabled={state.isDrawn}
+                    onChange={(event) => changeSelectedCount(index, Number(event.target.value))}
+                    value={state.selectedCounts[index] ?? zone.defaultCount}
+                  >
+                    {Array.from(
+                      { length: zone.pickMax - zone.pickMin + 1 },
+                      (_, optionIndex) => optionIndex + zone.pickMin,
+                    ).map((count) => <option key={count} value={count}>{count} 个</option>)}
+                  </select>
+                </label>
               ))}
+            </div>
+          ) : (
+            <div className="manual-picker">
+              {play.zones.map((zone, zoneIndex) => (
+                <div className="picker-zone" key={zone.id}>
+                  <div className="picker-head">
+                    <strong>{zone.label}</strong>
+                    <span>
+                      已选 {state.selections[zoneIndex]?.length ?? 0}
+                      {zone.pickMin === zone.pickMax ? `/${zone.pickMin}` : `（至少${zone.pickMin}）`}
+                    </span>
+                  </div>
+                  <div className="ball-grid">
+                    {getZoneValues(zone).map((number) => (
+                      <Ball
+                        disabled={state.isDrawn}
+                        key={number}
+                        onClick={() => toggleSelection(zoneIndex, number)}
+                        selected={state.selections[zoneIndex]?.includes(number)}
+                        style={zone.style}
+                        value={number}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ))}
+              <button
+                className="clear-button"
+                onClick={() => updateLottery(activeId, (current) => ({
+                  ...current,
+                  selections: play.zones.map(() => []),
+                }))}
+                type="button"
+              >
+                清空自选
+              </button>
+            </div>
+          )}
+
+          <div className="purchase-summary">
+            <div>
+              <span>下一张票</span>
+              <strong>
+                {state.purchaseMode === 'random'
+                  ? '随机生成'
+                  : `${formatNumber(previewBetCount)} 注`}
+              </strong>
+            </div>
+            <div>
+              <span>预计金额</span>
+              <strong>
+                {state.purchaseMode === 'random' && game.id === 'k3' && state.playType === 'double-single'
+                  ? '按组合计算'
+                  : `¥${formatNumber(state.purchaseMode === 'random'
+                    ? game.createRandomTicket(
+                      state.playType,
+                      state.selectedCounts,
+                      state.appended,
+                      0,
+                    ).cost
+                    : previewCost)}`}
+              </strong>
             </div>
           </div>
 
-          <div className="ball-group">
-            <div className="group-label">蓝球 <span className="dim">（至少选 1 个，1-16）</span></div>
-            <div className="ball-grid blue-grid">
-              {Array.from({ length: BLUE_MAX }, (_, i) => i + 1).map((n) => (
-                <Ball key={n} number={n} type="blue" selected={selectedBlues.has(n)} onClick={() => selectBlue(n)} disabled={isRunning} />
-              ))}
-            </div>
+          <div className="action-row">
+            <button className="primary-button" disabled={!canBuy} onClick={buyTicket} type="button">
+              {state.tickets.length ? '再买一张' : '购买一张'}
+            </button>
+            <button
+              className="draw-button"
+              disabled={state.isDrawn || state.tickets.length === 0}
+              onClick={() => updateLottery(activeId, (current) => ({ ...current, isDrawn: true }))}
+              type="button"
+            >
+              开奖
+            </button>
+            <button className="secondary-button" onClick={newRound} type="button">新一期</button>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="stats">
+            <div><strong>{state.tickets.length}</strong><span>已购票数</span></div>
+            <div><strong>{formatNumber(totalBetCount)}</strong><span>累计注数</span></div>
+            <div><strong>¥{formatNumber(totalCost)}</strong><span>累计金额</span></div>
           </div>
 
-          {hasSelection && (
-            <div className="selected-bar">
-              <span className="dim">已选：</span>
-              {sortedReds.map((n) => (
-                <Ball key={`s${n}`} number={n} type="red" size="sm" />
-              ))}
-              {sortedBlues.map((n) => (
-                <Ball key={`sb${n}`} number={n} type="blue" size="sm" />
-              ))}
-              {selectedReds.size < RED_COUNT && <span className="hint">还需 {RED_COUNT - selectedReds.size} 个红球</span>}
-              {selectedReds.size >= RED_COUNT && selectedBlues.size === 0 && <span className="hint">还需选 1 个蓝球</span>}
-              {betCount > 0 && (
-                <span className="bet-summary">
-                  {betCount === 1 ? '单式' : '复式'} · {formatNum(betCount)} 注 · ¥{formatNum(betCount * PRICE_PER_BET)}
-                </span>
-              )}
+          {state.tickets.length === 0 ? (
+            <div className="empty-state">选择玩法后随机购买或自选号码</div>
+          ) : (
+            <div className="ticket-list">
+              {[...state.tickets].reverse().map((ticket) => {
+                const result = state.isDrawn
+                  ? ticketResult(game, ticket, state.winningNumber)
+                  : null;
+                const ticketPlay = getPlay(game, ticket.playType);
+                const multiplier = ticket.multiplier ?? 1;
+                const baseBetCount = game.calculateBetCount(ticket.playType, ticket.selections);
+                return (
+                  <article className={result?.count ? 'ticket won' : 'ticket'} key={ticket.id}>
+                    <div className="ticket-head">
+                      <div>
+                        <strong>第 {ticket.id} 张 · {ticketPlay.name}</strong>
+                        {ticket.appended && <span className="tag">追加</span>}
+                      </div>
+                      <div className="ticket-meta">
+                        <span>
+                          {multiplier > 1
+                            ? `${formatNumber(baseBetCount)} 注 × ${multiplier} 份`
+                            : `${formatNumber(ticket.betCount)} 注`}
+                          {' · '}¥{formatNumber(ticket.cost)}
+                        </span>
+                        <TicketBetEditor
+                          baseBetCount={baseBetCount}
+                          betCount={ticket.betCount}
+                          disabled={state.isDrawn}
+                          key={`${ticket.id}-${ticket.betCount}`}
+                          onCommit={(betCount) => setTicketBetCount(ticket.id, betCount)}
+                        />
+                      </div>
+                    </div>
+                    {ticket.selections.length > 0
+                      ? (
+                        <NumberDisplay
+                          groups={ticket.selections}
+                          matchedGroups={state.isDrawn
+                            ? getTicketMatchedGroups(game, ticket, state.winningNumber)
+                            : undefined}
+                          styles={createTicketStyles(game, ticket)}
+                        />
+                      )
+                      : <div className="ticket-plain">{ticketPlay.description}</div>}
+                    {result && (
+                      <div className={result.count ? 'ticket-result won' : 'ticket-result'}>
+                        {result.count
+                          ? `${result.labels.join('、')} · ${result.count}注 · ¥${formatNumber(result.amount)}`
+                          : '未中奖'}
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
             </div>
           )}
         </section>
 
-        {/* ─── 控制区 ─── */}
-        <section className="card controls">
-          <div className="speed-row">
-            <span className="dim">速度：</span>
-            {(Object.keys(SPEED_CONFIG) as Speed[]).map((s) => (
-              <button
-                key={s}
-                className={`speed-btn${speed === s ? ' active' : ''}`}
-                onClick={() => setSpeed(s)}
-                disabled={isRunning}
-                type="button"
-              >
-                {SPEED_CONFIG[s].label}
-              </button>
-            ))}
-            <span className="speed-desc dim">{SPEED_CONFIG[speed].desc}</span>
-          </div>
-          <div className="btn-row">
-            {!isRunning ? (
-              <button className="btn btn-start" onClick={start} disabled={!canStart} type="button">
-                ▶ 开始模拟
-              </button>
-            ) : (
-              <button className="btn btn-stop" onClick={stop} type="button">
-                ⏹ 停止
-              </button>
-            )}
-            <button className="btn btn-reset" onClick={reset} disabled={isRunning} type="button">
-              ↺ 重置
-            </button>
-          </div>
-        </section>
-
-        {/* ─── 模拟过程 ─── */}
-        {(isRunning || attempts > 0) && !matched && (
-          <section className="card sim-panel">
-            <div className="stats">
-              <div className="stat">
-                <div className="stat-val">{formatNum(attempts)}</div>
-                <div className="stat-lbl">已模拟次数</div>
-              </div>
-              <div className="stat">
-                <div className="stat-val">{formatNum(tps)}</div>
-                <div className="stat-lbl">次/秒</div>
-              </div>
-              <div className="stat">
-                <div className="stat-val">{formatElapsed(elapsedMs)}</div>
-                <div className="stat-lbl">耗时</div>
-              </div>
-              <div className="stat">
-                <div className="stat-val">¥{formatNum(attempts * PRICE_PER_BET)}</div>
-                <div className="stat-lbl">花费 (2元/注)</div>
+        {state.isDrawn && (
+          <section className="card result-card">
+            <div className="result-title">开奖结果</div>
+            <div className="winning-number">
+              <span>本期开奖号码</span>
+              <NumberDisplay
+                groups={game.formatWinningNumber(state.winningNumber)}
+                styles={getWinningStyles(game, state.winningNumber)}
+              />
+              {game.id === 'qlc' && <small>最后一个蓝色号码为特别号</small>}
+            </div>
+            <div className="result-stats">
+              <div><span>中奖注数</span><strong>{formatNumber(winningCount)}</strong></div>
+              <div><span>模拟奖金</span><strong>¥{formatNumber(prizeAmount)}</strong></div>
+              <div>
+                <span>模拟盈亏</span>
+                <strong className={prizeAmount >= totalCost ? 'profit' : 'loss'}>
+                  {prizeAmount >= totalCost ? '+' : '-'}¥{formatNumber(Math.abs(prizeAmount - totalCost))}
+                </strong>
               </div>
             </div>
-            {currentTicket && (
-              <div className="current-row">
-                <span className="dim">当前机选：</span>
-                <div className="current-balls">
-                  {currentTicket.reds.map((n) => (
-                    <Ball key={`c${n}`} number={n} type="red" size="sm" />
-                  ))}
-                  <Ball number={currentTicket.blue} type="blue" size="sm" />
-                </div>
+            <div className="prize-table">
+              <div className="prize-row prize-head">
+                <span>奖项及中奖规则</span><span>注数</span><span>单注奖金</span><span>小计</span>
               </div>
-            )}
-          </section>
-        )}
-
-        {/* ─── 中奖结果 ─── */}
-        {matched && matchedTicket && (
-          <section className="card result-panel">
-            <div className="celebrate">🎉 恭喜中奖！🎉</div>
-            <div className="result-balls">
-              {matchedTicket.reds.map((n) => (
-                <Ball key={`r${n}`} number={n} type="red" size="lg" />
+              {prizeSummary.map((line) => (
+                <div className={line.count ? 'prize-row hit' : 'prize-row'} key={line.key}>
+                  <span className="prize-label">
+                    <span>{line.label}</span>
+                    <PrizeRuleDots game={game} line={line} />
+                  </span>
+                  <span>{formatNumber(line.count)}</span>
+                  <span>¥{formatNumber(line.unitPrize)}</span>
+                  <span>¥{formatNumber(line.amount)}</span>
+                </div>
               ))}
-              <Ball number={matchedTicket.blue} type="blue" size="lg" />
             </div>
-            {winningCompound && (
-              <div className="winning-compound">
-                <div className="compound-title">中奖复式号码</div>
-                <div className="compound-balls">
-                  {winningCompound.reds.map((n) => (
-                    <Ball key={`wr${n}`} number={n} type="red" size="sm" />
-                  ))}
-                  {winningCompound.blues.map((n) => (
-                    <Ball key={`wb${n}`} number={n} type="blue" size="sm" />
-                  ))}
-                </div>
-                <div className="dim">
-                  共 {formatNum(calculateBetCount(winningCompound.reds.length, winningCompound.blues.length))} 注，
-                  已汇总本轮随机出现过的全部红球和蓝球
-                </div>
-              </div>
-            )}
-            <div className="result-info">
-              <p>总共模拟 <strong>{formatNum(attempts)}</strong> 次</p>
-              <p>耗时 <strong>{formatElapsed(elapsedMs)}</strong></p>
-              <p>花费 <strong>¥{formatNum(attempts * PRICE_PER_BET)}</strong></p>
-              <p className="dim">
-                当前复式共 {formatNum(betCount)} 注，理论期望 {formatNum(Math.round(expectedAttempts))} 次，
-                实际为理论的 {(attempts / expectedAttempts).toFixed(2)} 倍
-              </p>
-            </div>
-            <div className="btn-row" style={{ marginTop: 16 }}>
-              <button className="btn btn-start" onClick={rerun} type="button">▶ 再来一次</button>
-              <button className="btn btn-reset" onClick={reset} type="button">↺ 重新选号</button>
-            </div>
+            <p className="prize-note">
+              标注“模拟”的浮动奖使用估算金额；实际奖金会随当期销量、奖池和中奖注数变化。
+            </p>
           </section>
         )}
       </main>
 
-      <aside className="card random-sidebar">
-        <div className="card-head">
-          <h2>随机号码记录</h2>
-          <span className="dim">最近 {HISTORY_LIMIT} 条</span>
-        </div>
-
-        <div className="sidebar-current">
-          <div className="sidebar-label">当前随机号码</div>
-          {currentTicket ? (
-            <div className="sidebar-balls">
-              {currentTicket.reds.map((n) => (
-                <Ball key={`side-current-red-${n}`} number={n} type="red" size="sm" />
-              ))}
-              <Ball number={currentTicket.blue} type="blue" size="sm" />
-            </div>
-          ) : (
-            <div className="sidebar-empty">开始模拟后在这里显示</div>
-          )}
-        </div>
-
-        <div className="sidebar-compound">
-          <div className="sidebar-label">最终复式号码（实时）</div>
-          {winningCompound ? (
-            <>
-              <div className="compound-section">
-                <span className="compound-kind red-kind">红球 {winningCompound.reds.length}</span>
-                <div className="sidebar-balls">
-                  {winningCompound.reds.map((n) => (
-                    <Ball key={`side-compound-red-${n}`} number={n} type="red" size="sm" />
-                  ))}
-                </div>
-              </div>
-              <div className="compound-section">
-                <span className="compound-kind blue-kind">蓝球 {winningCompound.blues.length}</span>
-                <div className="sidebar-balls">
-                  {winningCompound.blues.map((n) => (
-                    <Ball key={`side-compound-blue-${n}`} number={n} type="blue" size="sm" />
-                  ))}
-                </div>
-              </div>
-              <div className="compound-count">
-                {formatNum(calculateBetCount(winningCompound.reds.length, winningCompound.blues.length))} 注
-              </div>
-            </>
-          ) : (
-            <div className="sidebar-empty">随机号码会实时加入这里</div>
-          )}
-        </div>
-
-        <div className="history-list">
-          {ticketHistory.map((record, index) => (
-            <div
-              className={`history-item${matched && index === 0 ? ' history-winner' : ''}`}
-              key={`${record.attempt}-${record.ticket.reds.join('-')}-${record.ticket.blue}`}
-            >
-              <span className="history-index">#{formatNum(record.attempt)}</span>
-              <div className="history-numbers">
-                <span className="history-reds">
-                  {record.ticket.reds.map((n) => String(n).padStart(2, '0')).join(' ')}
-                </span>
-                <span className="history-blue">{String(record.ticket.blue).padStart(2, '0')}</span>
-              </div>
-            </div>
-          ))}
-          {ticketHistory.length === 0 && (
-            <div className="sidebar-empty history-empty">暂无随机记录</div>
-          )}
-        </div>
-      </aside>
-      </div>
-
-      <footer className="footer">
-        双色球一等奖概率 1/{formatNum(TOTAL_COMBINATIONS)} · 每注 2 元 · 纯属娱乐，请理性购彩
+      <footer>
+        所有号码均在本地随机生成并保存在浏览器中 · 每注基础价格2元 · 纯属娱乐，请理性购彩
       </footer>
     </div>
   );
